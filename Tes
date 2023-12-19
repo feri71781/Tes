@@ -1,0 +1,432 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	timeout     = 1 * time.Second // timeout
+	maxDuration = 2 * time.Second // maxDuration
+)
+
+type ScanResult struct {
+	Success int    `json:"success"`
+	Msg     Msg    `json:"msg"`
+	IP      string `json:"ip"`
+	Region  string `json:"region"`
+}
+
+type Msg struct {
+	Status string `json:"status"`
+	IP     string `json:"ip"`
+	Port   string `json:"port"`
+}
+
+func main() {
+	fileName := "ip.txt"
+	var ports []string
+	osType := runtime.GOOS
+
+	if osType == "linux" && os.Getuid() == 0 {
+		increaseMaxOpenFiles()
+	}
+	maxThreads := flag.Int("max", 400, "maximum number of threads")
+	asn := flag.String("asn", "", "ASN number")
+	enableTLS := flag.Bool("enable", false, "enable TLS")
+	portsStr := ""
+	flag.StringVar(&portsStr, "port", "1-65535", "comma-separated ports or port ranges")
+	flag.Parse()
+
+	if *asn != "" {
+		// ASN save as ip.txt
+		err := getASNInfo(*asn)
+		if err != nil {
+			fmt.Println("Failed to get ASN info:", err)
+			return
+		}
+	}
+
+	parsedPorts, err := parsePorts(portsStr)
+	if err != nil {
+		fmt.Println("Failed to parse ports:", err)
+		return
+	}
+
+	ports = parsedPorts
+
+	// Perform API scan on given IP addresses and ports
+	results := apiscan(fileName, ports, *maxThreads, *enableTLS)
+
+	outputFileName := "scan_results.txt"
+	err = writeScanResultsToFile(results, outputFileName)
+	if err != nil {
+		fmt.Println("Failed to write scan results to file:", err)
+		return
+	}
+
+	fmt.Println("Scan results written to", outputFileName)
+}
+
+func increaseMaxOpenFiles() {
+	cmd := exec.Command("bash", "-c", "ulimit -n 10000000")
+	_, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("increaseMaxOpenFiles error: %v\n", err)
+	}
+}
+
+func parsePorts(portsStr string) ([]string, error) {
+	ports := make([]string, 0)
+
+	portItems := strings.Split(portsStr, ",")
+	for _, item := range portItems {
+		if strings.Contains(item, "-") {
+			rangePorts := strings.Split(item, "-")
+			if len(rangePorts) != 2 {
+				return nil, fmt.Errorf("invalid port range: %s", item)
+			}
+
+			startPort, err := strconv.Atoi(rangePorts[0])
+			if err != nil {
+				return nil, fmt.Errorf("invalid start port in range: %s", item)
+			}
+
+			endPort, err := strconv.Atoi(rangePorts[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid end port in range: %s", item)
+			}
+
+			if startPort < 1 || endPort > 65535 || startPort > endPort {
+				return nil, fmt.Errorf("invalid port range: %s", item)
+			}
+
+			for port := startPort; port <= endPort; port++ {
+				ports = append(ports, strconv.Itoa(port))
+			}
+		} else {
+			port, err := strconv.Atoi(item)
+			if err != nil {
+				return nil, fmt.Errorf("invalid port: %s", item)
+			}
+
+			if port < 1 || port > 65535 {
+				return nil, fmt.Errorf("invalid port: %s", item)
+			}
+
+			ports = append(ports, strconv.Itoa(port))
+		}
+	}
+
+	return ports, nil
+}
+
+// ...rest of the code remains the same...
+
+func getASNInfo(asn string) error {
+	// Construct the URL for the API call
+	url := fmt.Sprintf("https://ipinfo.xn--b6gac.eu.org/%s/ipv4", asn)
+
+	// Perform the HTTP GET request to the API
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// Write the response body to the ip.txt file
+	err = os.WriteFile("ip.txt", body, 0644)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func apiscan(fileName string, ports []string, maxThreads int, enableTLS bool) []ScanResult {
+	var wg sync.WaitGroup
+	results := make([]ScanResult, 0)
+	semaphore := make(chan struct{}, maxThreads) // Use a channel as a semaphore to limit the number of goroutines simultaneously
+
+	// Read IP addresses from file
+	IPs := readIPsFromFile(fileName)
+	if len(IPs) == 0 {
+		fmt.Println("No IP addresses found in the file.")
+		return results
+	}
+
+	currentIP := 0
+	var counterMutex sync.Mutex
+	for _, ip := range IPs {
+		// Convert CIDR notation to individual IP addresses
+		cidrIPs, err := ConvertCIDRToIPs(ip)
+		if err != nil {
+			fmt.Printf("Failed to convert CIDR to IPs for IP: %s\n", ip)
+			continue
+		}
+
+		numIPs := len(cidrIPs) // Update numIPs with the correct count of IP addresses
+
+		for _, cidrIP := range cidrIPs {
+			for _, port := range ports {
+				wg.Add(1)
+				semaphore <- struct{}{} // Acquire a semaphore
+
+				go func(ip, port string) {
+					defer func() {
+						wg.Done()
+						<-semaphore // Release the semaphore
+						counterMutex.Lock()
+						currentIP++
+						percentage := float64(currentIP) / float64(numIPs) * 100
+
+						fmt.Printf("%d/%d %.2f%% %s:%s\n", currentIP, numIPs, percentage, ip, port)
+						counterMutex.Unlock()
+					}()
+
+					// Construct URL for API call
+					url := fmt.Sprintf("http://duankou.wlphp.com/api.php?i=%s&p=%s", ip, port)
+
+					// Perform HTTP GET request to the API
+					resp, err := http.Get(url)
+					if err != nil {
+						// Handle error during HTTP request
+						return
+					}
+					defer resp.Body.Close()
+
+					// Read response body
+					body, err := io.ReadAll(resp.Body)
+					if err != nil {
+						// Handle error while reading response body
+						return
+					}
+
+					// Extract JSON response from body using regex
+					jsonRegex := regexp.MustCompile(`{.*}`)
+					jsonResp := jsonRegex.Find(body)
+					// fmt.Print(jsonResp)
+
+					// Parse JSON response
+					var result ScanResult
+					err = json.Unmarshal(jsonResp, &result)
+					if err != nil {
+						// Handle JSON parsing error
+						return
+					}
+					// Append successful scan results to the results slice
+					if result.Success == 1 && result.Msg.Status == "Openning" {
+						dialer := &net.Dialer{
+							Timeout:   timeout,
+							KeepAlive: 0,
+						}
+						start := time.Now()
+						conn, err := dialer.Dial("tcp", net.JoinHostPort(result.Msg.IP, result.Msg.Port))
+						if err != nil {
+							return
+						}
+						defer func(conn net.Conn) {
+							err := conn.Close()
+							if err != nil {
+								return
+							}
+						}(conn)
+						// tcpDuration := time.Since(start)
+						start = time.Now()
+
+						client := http.Client{
+							Transport: &http.Transport{
+								Dial: func(network, addr string) (net.Conn, error) {
+									return conn, nil
+								},
+							},
+							Timeout: timeout,
+						}
+
+						var protocol string
+						if enableTLS {
+							protocol = "https://"
+						} else {
+							protocol = "http://"
+						}
+						requestURL := protocol + "speed.cloudflare.com/cdn-cgi/trace"
+
+						req, _ := http.NewRequest("GET", requestURL, nil)
+						req.Header.Set("User-Agent", "Mozilla/5.0")
+						req.Close = true
+						ctx, cancel := context.WithTimeout(context.Background(), maxDuration)
+						defer cancel()
+
+						req = req.WithContext(ctx)
+
+						resp, err := client.Do(req)
+						if err != nil {
+							return
+						}
+
+						defer resp.Body.Close()
+						duration := time.Since(start)
+						if duration > maxDuration {
+							return
+						}
+						// 使用io.ReadAll读取响应，并设置超时处理
+						bodyCh := make(chan []byte, 1)
+						go func() {
+							body, err := io.ReadAll(resp.Body)
+							if err != nil {
+								fmt.Println(err)
+								return
+							}
+							bodyCh <- body
+						}()
+						select {
+						case body := <-bodyCh:
+							bodyStr := string(body)
+
+							if !strings.Contains(bodyStr, "uag=Mozilla/5.0") {
+								return
+							}
+							// Lock the file before writing to avoid race condition
+							writeToFile(fmt.Sprintf("%s,%s,%s\n", result.IP, result.Msg.Port, result.Msg.Status), "live_scan_results.txt")
+
+						case <-ctx.Done():
+							//fmt.Println("Request timed out while reading response")
+							return
+						}
+						writeToFile(fmt.Sprintf("%s,%s,%s\n", result.IP, result.Msg.Port, result.Msg.Status), "live_scan_results.txt")
+
+					}
+				}(cidrIP, port)
+			}
+		}
+	}
+
+	wg.Wait()
+
+	return results
+}
+
+// ...rest of the code remains the same...
+
+func writeToFile(line, fileName string) {
+	file, err := os.OpenFile(fileName, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0644)
+	if err != nil {
+		fmt.Println("Failed to open file:", err)
+		return
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	_, err = writer.WriteString(line)
+	if err != nil {
+		fmt.Println("Failed to write to file:", err)
+		return
+	}
+
+	writer.Flush()
+}
+
+func readIPsFromFile(fileName string) []string {
+	ips := make([]string, 0)
+
+	// Open file for reading
+	file, err := os.Open(fileName)
+	if err != nil {
+		fmt.Println("Failed to open file.")
+		return ips
+	}
+	defer file.Close()
+
+	// Read IP addresses line by line
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		ip := strings.TrimSpace(scanner.Text())
+		if ip != "" {
+			ips = append(ips, ip)
+		}
+	}
+
+	// Check for any errors while reading file
+	if err := scanner.Err(); err != nil {
+		fmt.Println("Failed to read file.")
+		return ips
+	}
+
+	return ips
+}
+func ConvertCIDRToIPs(cidr string) ([]string, error) {
+	parts := strings.Split(cidr, "/")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid CIDR format: %s", cidr)
+	}
+
+	ips := make([]string, 0)
+	ip := parts[0]
+	prefix, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid CIDR format: %s", cidr)
+	}
+
+	cidrIP := net.ParseIP(ip)
+	if cidrIP == nil {
+		return nil, fmt.Errorf("invalid IP address: %s", ip)
+	}
+
+	ipNet := &net.IPNet{IP: cidrIP, Mask: net.CIDRMask(prefix, 32)}
+	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incIP(ip) {
+		ips = append(ips, ip.String())
+	}
+
+	return ips, nil
+}
+
+func incIP(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
+}
+
+func writeScanResultsToFile(results []ScanResult, fileName string) error {
+	file, err := os.Create(fileName)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	for _, result := range results {
+		if result.Msg.Status == "Openning" {
+			line := fmt.Sprintf("IP: %s, Port: %s, Status: %s\n", result.IP, result.Msg.Port, result.Msg.Status)
+			_, err := writer.WriteString(line)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	writer.Flush()
+	return nil
+}
